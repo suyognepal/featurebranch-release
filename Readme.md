@@ -7,7 +7,7 @@ This repository contains Ansible playbooks and Jenkins pipelines for automating 
 ```
 ├── ansible
 │   ├── inventory
-│   │   └── servers.ini                    # Ansible inventory file for deployment hosts
+│   │   └── edgedb.ini                    # Ansible inventory file for deployment hosts
 │   ├── roles
 │   │   └── deployment
 │   │       ├── handlers
