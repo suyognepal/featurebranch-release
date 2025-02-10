@@ -48,7 +48,7 @@ This repository contains Ansible playbooks and Jenkins pipelines for automating 
 - The `Jenkinsfile` automates the deployment process for feature branches.
 - It creates the entire environment, including database, socket, worker, backend deployment, and frontend.
 - Environment variables are generated using the `genenv` scripts.
-- The pipeline is triggered on feature branch updates.
+- The pipeline should be manually tirggered with inputs defind on jenkins parameters.
 
 #### Resource Cleanup
 - The `Jenkinsfile-Delete-Resources` script is used to delete unused or old resources.
