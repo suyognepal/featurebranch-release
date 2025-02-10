@@ -1,0 +1,1085 @@
+pipeline {
+    agent any
+
+    environment {
+        GIT_REPO_URL = "https://git.example.com/backend.git"
+        SOCKET_REPO_URL = "https://git.example.com/socket.git"
+        FRONTEND_GIT_REPO_URL = "https://git.example.com/frontend.git"
+        GIT_REPO_CREDENTIALS = "gitlabtokens"
+        VAULT_CICD_PATH = "infra/release-ansible"
+        VAULT_TOKEN = credentials('VAULT_TOKEN')
+        IMAGE_REPOSITORY = "harbor.example.com"
+        VAULT_SERVER = "vault.example.com"
+        VAULT_HELM_PATH = "appsecrets/secret/path/helm-release"
+        VAULT_SECRET_PATH = "appsecrets/secret/path/release" 
+        VAULT_FRONTEND_COMMON_PATH = "appsecrets/secret/path/common"   
+        VAULT_FRONTEND_HELM_PATH = "appsecrets/secret/path/helm-release"
+        HELM_REGISTRY = credentials('helm-registry')
+        AWS_DEFAULT_REGION = 'us-east-1'
+        ECR_DEFAULT_REGION = 'us-east-2'
+        ENVIRONMENT = 'release'
+        NODE_VERSION = "20.9.0"
+        NVM_DIR = "$HOME/.nvm"
+        NVM_SETUP = 'export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+        PROJECT_NAME = 'projectname'
+        SLACK_WEBHOOK_URL = credentials('deploymentslackwebhook')
+    }
+
+    parameters {
+        string(name: 'BACKEND_DEPLOY_BRANCH', defaultValue: 'main', description: 'Branch to Deploy')
+        string(name: 'DATABASE_PORT', defaultValue: '10703', description: 'Define Database Port')
+        string(name: 'DATABASE_BRANCH', defaultValue: 'main', description: 'Define Database git BRANCH')
+        string(name: 'SOCKET_DEPLOY_BRANCH', defaultValue: 'dev', description: 'Define Socket git BRANCH')
+        string(name: 'FRONTEND_DEPLOY_BRANCH', defaultValue: 'dev', description: 'Define Frontend git BRANCH')
+
+    }
+
+    stages {
+        stage('Fetch Secrets and Prepare Variables') {
+            steps {
+                script {
+                    def vaultResponse = sh(
+                        script: """
+                        curl -sk -H "X-Vault-Token: ${VAULT_TOKEN}" -X GET https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH}
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def secretsData = readJSON text: vaultResponse
+                    def secrets = readYaml text: secretsData.data["vars.yaml"]
+
+                    def sshKey = secretsData.data["id_rsa.pem"]
+                    writeFile file: 'id_rsa.pem', text: sshKey
+                    sh "chmod 600 id_rsa.pem"
+                    env.BACKEND_DEPLOY_BRANCH_LOWER = "${params.BACKEND_DEPLOY_BRANCH}".toLowerCase()
+                    env.DB_INSTANCE = params.BACKEND_DEPLOY_BRANCH
+                    env.DB_PORT = params.DATABASE_PORT
+                    env.DB_BRANCH_INSTANCE = "${params.BACKEND_DEPLOY_BRANCH}-branch"
+                    env.GIT_USER = secrets.gituser
+                    env.GIT_PASSWORD = secrets.gitpassword
+                    env.DNS_RECORD = "${params.BACKEND_DEPLOY_BRANCH}-db.example.com"
+                    env.CLOUDFLARE_TOKEN = secrets.cloudfare_token
+                    env.DNS_ZONE = secrets.dns_zone
+                    env.ADMIN_EMAIL = "system@example.com"
+                    env.FRONT_END_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}.example.com"
+                    env.BACKEND_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}-api.example.com"
+                    env.SOCKET_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}-socket.example.com"
+                }
+            }
+        }
+
+        stage('Prepare Environment') {
+            steps {
+                sh "apt-get update && apt-get install -y jq"
+            }
+        }
+
+        stage('Deploy Database') {
+            steps {
+                script {
+                    sh """
+                    export ANSIBLE_HOST_KEY_CHECKING=False
+                    ansible-playbook -i ansible/inventory/edgedb.ini ansible/sitefiles/edgedb.yaml \
+                    --private-key=id_rsa.pem \
+                    --extra-vars "db_instance=${DB_INSTANCE} db_port=${DB_PORT} db_branch_instance=${DB_BRANCH_INSTANCE} \
+                    gituser=${GIT_USER} gitpassword=${GIT_PASSWORD} dns_record=${DNS_RECORD} \
+                    cloudfare_token=${CLOUDFLARE_TOKEN} dns_zone=${DNS_ZONE} gitbranch=${DATABASE_BRANCH} backend_deploy_branch=${BACKEND_DEPLOY_BRANCH} admin_email=${ADMIN_EMAIL} \
+                    frontend_url=${FRONT_END_DOMAIN}"
+                    """
+                }
+            }
+        }
+
+        stage('Create Backend .env') {
+            steps {
+                script {
+                    sh """
+                    python3 jenkins/release-branch/genenv.py --frontend-domain ${FRONT_END_DOMAIN} --backend-domain ${BACKEND_DOMAIN} \
+                    --database-branch ${DB_BRANCH_INSTANCE} \
+                    --database-domain ${DNS_RECORD} \
+                    --namespace ${params.BACKEND_DEPLOY_BRANCH} \
+                    --env-file .env
+                    """
+                }
+                archiveArtifacts artifacts: '.env', fingerprint: true       
+
+                stash includes: '.env', name: '.env'         
+            }
+        }
+
+        stage('Create Socket .env') {
+            steps {
+                script {
+                    sh """
+                    cp .env socket-mid.env
+                    awk '/^EDGEDB=/{flag=1; sub(/^EDGEDB=/, "DATABASE="); print; next} /^DEFAULT=/{flag=0} flag' socket-mid.env > socket.env
+                    python3 jenkins/release-branch/genenvsocket.py \
+                    --namespace ${params.BACKEND_DEPLOY_BRANCH} \
+                    --env-file socket.env
+                    """
+                }   
+                archiveArtifacts artifacts: 'socket.env', fingerprint: true       
+
+                stash includes: 'socket.env', name: 'socket.env'     
+            }
+        }
+
+        stage('Create Frontend .env') {
+            steps {
+                script {
+                    sh """
+                    python3 jenkins/release-branch/genenvfront.py \
+                    --backend-url ${BACKEND_DOMAIN} \
+                    --frontend-url ${FRONT_END_DOMAIN} \
+                    --socket-url ${SOCKET_DOMAIN} \
+                    --env-file frontend.env
+                    """
+                }   
+                archiveArtifacts artifacts: 'frontend.env', fingerprint: true       
+
+                stash includes: 'frontend.env', name: 'frontend.env'     
+            }
+        }
+
+        stage('Configure AWS Credentials') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'aws-credentials', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh """
+                    aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                    aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                    aws configure set region $AWS_DEFAULT_REGION
+                    """
+                }
+            }
+        }
+
+        stage('Request Backend ACM Certificate') {
+            steps {
+                script {
+                    echo 'Requesting ACM certificate...'
+                    def certificateArn = sh(
+                        script: """
+                        aws acm request-certificate \
+                            --domain-name ${BACKEND_DOMAIN} \
+                            --validation-method DNS \
+                            --subject-alternative-names www.${BACKEND_DOMAIN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json | jq -r '.CertificateArn'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    env.CERTIFICATEARN = certificateArn
+                    echo "Certificate ARN: ${CERTIFICATEARN}"
+
+                    echo 'Fetching domain validation records...'
+                    def validationOutput = sh(
+                        script: """
+                        aws acm describe-certificate \
+                            --certificate-arn ${CERTIFICATEARN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def validationData = readJSON text: validationOutput
+                    def domainValidationOptions = validationData.Certificate.DomainValidationOptions
+
+                    env.RESOURCE_RECORDS = domainValidationOptions.collect { domainValidation ->
+                        if (domainValidation.ValidationStatus == 'PENDING_VALIDATION' && domainValidation.containsKey('ResourceRecord') && domainValidation.ResourceRecord) {
+                            def resourceRecord = domainValidation.ResourceRecord
+                            echo "Validation for ${domainValidation.DomainName} requires DNS record:"
+                            echo "Name: ${resourceRecord.Name}"
+                            echo "Type: ${resourceRecord.Type}"
+                            echo "Value: ${resourceRecord.Value}"
+                            return "${resourceRecord.Name},${resourceRecord.Value}"
+                        } else if (domainValidation.ValidationStatus == 'SUCCESS') {
+                            echo "Validation for ${domainValidation.DomainName} is successful."
+                            return null  // No DNS record required for successful validation
+                        }
+                        return null
+                    }.findAll { it != null }.join('|')  // Use '|' as a delimiter
+                }
+            }
+        }
+
+        stage('Map CNAME in Cloudflare') {
+            steps {
+                script {
+                    if (!env.RESOURCE_RECORDS) {
+                        echo "Skipping CNAME mapping in Cloudflare as all validations are successful."
+                        return
+                    }
+                    echo 'Mapping CNAME in Cloudflare...'
+                    env.RESOURCE_RECORDS.split('\\|').each { record ->
+                        def (name, value) = record.split(',')
+                        sh """
+                        curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            --data '{
+                                "type": "CNAME",
+                                "name": "${name}",
+                                "content": "${value}",
+                                "ttl": 60,
+                                "proxied": false
+                            }'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Backend Checkout Code') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: "*/${BACKEND_DEPLOY_BRANCH}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${GIT_REPO_CREDENTIALS}", url: "${GIT_REPO_URL}"]]]) 
+            }
+        }
+
+        stage('Backend Retrieve Environment Variables') {
+            steps {
+                script {
+                    def secrets = sh(script: """
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_HELM_PATH} | jq -r '.data'
+                    """, returnStdout: true).trim()
+
+                    CHART_NAME = sh(script: "echo '${secrets}' | jq -r '.CHART_NAME'", returnStdout: true).trim()
+                    CHART_VERSION = sh(script: "echo '${secrets}' | jq -r '.CHART_VERSION'", returnStdout: true).trim()
+                    PYPI_USERNAME = sh(script: "echo '${secrets}' | jq -r '.PYPI_USERNAME'", returnStdout: true).trim()
+                    PYPI_PASSWORD = sh(script: "echo '${secrets}' | jq -r '.PYPI_PASSWORD'", returnStdout: true).trim()
+
+
+                    env.CHART_NAME = CHART_NAME
+                    env.CHART_VERSION = CHART_VERSION
+                    env.PYPI_USERNAME = PYPI_USERNAME
+                    env.PYPI_PASSWORD = PYPI_PASSWORD
+
+                    sh '''
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_SECRET_PATH} | jq -r '.data["google_service.json"]' > google_service.json
+                        if [ $? -ne 0 ] || grep -q "null" google_service.json || [ ! -s google_service.json ]; then
+                            echo "Failed: google_service.json file is empty or invalid."
+                            exit 1
+                        fi
+                    '''
+
+
+                    sh '''
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH} | jq -r '.data["kubeconfig"]' > kubeconfig.yaml
+                        if [ $? -ne 0 ] || grep -q "null" kubeconfig.yaml || [ ! -s kubeconfig.yaml ]; then
+                            echo "Failed: kubeconfig.yaml file is empty or invalid."
+                            exit 1
+                        fi
+                    '''
+
+                    echo "kubeconfig.yaml has been successfully written to file."
+                }
+            }
+        }
+
+        stage('Backend Build Docker Image') {
+            steps {
+                script {
+                    backendImage = docker.build("${IMAGE_REPOSITORY}/${PROJECT_NAME}/backend-${BACKEND_DEPLOY_BRANCH_LOWER}:${env.BUILD_ID}",
+                        "--build-arg PYPI_USERNAME=${env.PYPI_USERNAME} --build-arg PYPI_PASSWORD=${env.PYPI_PASSWORD} .")
+                }
+            }
+        }
+
+        stage('Backend Push Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${IMAGE_REPOSITORY}", "DCR_AUTH") {
+                        backendImage.push("${env.BUILD_ID}")
+                    }
+                }
+            }
+        }
+
+        stage('Backend Apply ENV Variable') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'DCR_AUTH', 
+                                                    usernameVariable: 'DOCKER_USERNAME', 
+                                                    passwordVariable: 'DOCKER_PASSWORD')]) {
+
+                        unstash name: '.env'    
+                                                    
+                        sh """ 
+                        export KUBECONFIG=kubeconfig.yaml
+
+                        # Namespace creation
+                        if ! kubectl get namespace \${BACKEND_DEPLOY_BRANCH_LOWER} >/dev/null 2>&1; then
+                            kubectl create namespace \${BACKEND_DEPLOY_BRANCH_LOWER}
+                            echo "Namespace \${BACKEND_DEPLOY_BRANCH_LOWER} created."
+                        else
+                            echo "Namespace \${BACKEND_DEPLOY_BRANCH_LOWER} already exists."
+                        fi
+
+                        # App secrets
+                        kubectl delete secret app-secret --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER} --ignore-not-found
+                        kubectl create secret generic app-secret --from-file=.env --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER}
+
+                        kubectl delete secret google-secret --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER} --ignore-not-found
+                        kubectl create secret generic google-secret --from-file=google_service.json --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER}
+
+                        # Docker registry secret
+                        if ! kubectl get secret registry-creds --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER} >/dev/null 2>&1; then
+                            kubectl create secret docker-registry registry-creds \\
+                                --docker-server=${IMAGE_REPOSITORY} \\
+                                --docker-username=${DOCKER_USERNAME} \\
+                                --docker-password=${DOCKER_PASSWORD} \\
+                                --docker-email=${ADMIN_EMAIL} \\
+                                --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER}
+                        else
+                            echo "Docker registry secret already exists."
+                        fi
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Backend Pull Chart') {
+            steps {
+                script {
+                    sh """
+                    aws ecr get-login-password --region ${ECR_DEFAULT_REGION} | helm registry login --username AWS --password-stdin ${HELM_REGISTRY}
+                    helm pull oci://${HELM_REGISTRY}/${CHART_NAME} --version ${CHART_VERSION}
+                    tar -xvf ${CHART_NAME}-${CHART_VERSION}.tgz
+                    """
+                }
+            }
+        }
+
+        stage('Backend Apply Deploy') {
+            steps {
+                script {
+                    sh """
+                    export KUBECONFIG=kubeconfig.yaml
+
+                    # Helm upgrade/install command for apply action
+                    helm upgrade --install hive-release-${BACKEND_DEPLOY_BRANCH_LOWER} ./${CHART_NAME} --create-namespace \\
+                        --namespace ${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set app.replicaCount=1 \\
+                        --set app.image.repository=${IMAGE_REPOSITORY}/${PROJECT_NAME}/backend-${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set app.image.tag=${env.BUILD_ID} \\
+                        --set global.environment=hive-${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set ingress.enabled=true \\
+                        --set ingress.host=${BACKEND_DOMAIN} \\
+                        --set ingress.certificateArn=${env.CERTIFICATEARN} \\
+                        --set ingress.environment=${ENVIRONMENT} \\
+                        --set redis.enabled=true \\
+                        --set app.clusterIP.enabled=true \\
+                        --set app.resources.requests.cpu="700m" \\
+                        --set app.resources.requests.memory="1.6Gi" \\
+                        --set app.resources.limits.cpu="1000m" \\
+                        --set app.resources.limits.memory="1.9Gi" \\
+                        --set ingress.group.enabled=true \\
+                        --set worker.enabled=true \\
+                        --set worker.replicaCount=1 \\
+                        --set worker.workerCount=1
+                    """
+                }
+            }
+        }
+        stage('Backend Map Ingress Address to Cloudflare') {
+            steps {
+                script {
+                    echo 'Fetching ingress address...'
+                    
+                    def ingressAddress = ''
+                    def maxRetries = 10
+                    def retryInterval = 10 // seconds
+                    def attempt = 1
+
+                    while ((!ingressAddress || ingressAddress == '80' || ingressAddress == '443') && attempt <= maxRetries) {
+                        echo "Attempt ${attempt} to fetch ingress address..."
+                        ingressAddress = sh(
+                            script: """
+                            export KUBECONFIG=kubeconfig.yaml
+                            INGRESS_HOSTNAME=\$(kubectl get ingress -n ${BACKEND_DEPLOY_BRANCH_LOWER} -o jsonpath="{.items[?(@.spec.rules[0].host=='${BACKEND_DOMAIN}')].status.loadBalancer.ingress[0].hostname}")
+                            echo \$INGRESS_HOSTNAME
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                            echo "Invalid ingress address (${ingressAddress}), retrying in ${retryInterval} seconds..."
+                            sleep retryInterval
+                        }
+
+                        attempt++
+                    }
+
+                    if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                        error "Valid ingress address not found after ${maxRetries} attempts. Please verify the ingress configuration."
+                    }
+
+                    echo "Ingress Address: ${ingressAddress}"
+                    echo "Mapping CNAME in Cloudflare..."
+
+                    sh """
+                    curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                        -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        --data '{
+                            "type": "CNAME",
+                            "name": "${BACKEND_DOMAIN}",
+                            "content": "${ingressAddress}",
+                            "ttl": 60,
+                            "proxied": false
+                        }'
+                    """
+                }
+            }
+        }
+        stage('Socket Request ACM Certificate') {
+            steps {
+                script {
+                    echo 'Requesting ACM certificate...'
+                    def certificateArn = sh(
+                        script: """
+                        aws acm request-certificate \
+                            --domain-name ${SOCKET_DOMAIN} \
+                            --validation-method DNS \
+                            --subject-alternative-names www.${SOCKET_DOMAIN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json | jq -r '.CertificateArn'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    env.SOCKETCERTIFICATEARN = certificateArn
+                    echo "Certificate ARN: ${SOCKETCERTIFICATEARN}"
+
+                    echo 'Fetching domain validation records...'
+                    def validationOutput = sh(
+                        script: """
+                        aws acm describe-certificate \
+                            --certificate-arn ${SOCKETCERTIFICATEARN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def validationData = readJSON text: validationOutput
+                    def domainValidationOptions = validationData.Certificate.DomainValidationOptions
+
+                    env.RESOURCE_RECORDS = domainValidationOptions.collect { domainValidation ->
+                        if (domainValidation.ValidationStatus == 'PENDING_VALIDATION' && domainValidation.containsKey('ResourceRecord') && domainValidation.ResourceRecord) {
+                            def resourceRecord = domainValidation.ResourceRecord
+                            echo "Validation for ${domainValidation.DomainName} requires DNS record:"
+                            echo "Name: ${resourceRecord.Name}"
+                            echo "Type: ${resourceRecord.Type}"
+                            echo "Value: ${resourceRecord.Value}"
+                            return "${resourceRecord.Name},${resourceRecord.Value}"
+                        } else if (domainValidation.ValidationStatus == 'SUCCESS') {
+                            echo "Validation for ${domainValidation.DomainName} is successful."
+                            return null  // No DNS record required for successful validation
+                        }
+                        return null
+                    }.findAll { it != null }.join('|')  // Use '|' as a delimiter
+
+                    // if (!env.RESOURCE_RECORDS) {
+                    //     error "No DNS validation records found. Please check previous stage for errors."
+                    // }
+                }
+            }
+        }
+
+        stage('Map Socket CNAME in Cloudflare') {
+            steps {
+                script {
+                    if (!env.RESOURCE_RECORDS) {
+                        echo "Skipping CNAME mapping in Cloudflare as all validations are successful."
+                        return
+                    }
+                    echo 'Mapping CNAME in Cloudflare...'
+                    env.RESOURCE_RECORDS.split('\\|').each { record ->
+                        def (name, value) = record.split(',')
+                        sh """
+                        curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            --data '{
+                                "type": "CNAME",
+                                "name": "${name}",
+                                "content": "${value}",
+                                "ttl": 60,
+                                "proxied": false
+                            }'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Socket Checkout Code') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: "*/${SOCKET_DEPLOY_BRANCH}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${GIT_REPO_CREDENTIALS}", url: "${SOCKET_REPO_URL}"]]]) 
+            }
+        }
+
+        stage('Build Socket Docker Image') {
+            steps {
+                script {
+                    socketImage = docker.build("${IMAGE_REPOSITORY}/${PROJECT_NAME}/socket-${BACKEND_DEPLOY_BRANCH_LOWER}:${env.BUILD_ID}", 
+                        "--build-arg PYPI_USERNAME=${env.PYPI_USERNAME} --build-arg PYPI_PASSWORD=${env.PYPI_PASSWORD} .")
+                }
+            }
+        }
+
+        stage('Socket Push Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${IMAGE_REPOSITORY}", "DCR_AUTH") {
+                        socketImage.spush("${env.BUILD_ID}")
+                    }
+                }
+            }
+        }
+
+        stage('Socket Retrieve Environment Variables') {
+            steps {
+                script {
+                    sh '''
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH} | jq -r '.data["kubeconfig"]' > kubeconfig.yaml
+                        if [ $? -ne 0 ] || grep -q "null" kubeconfig.yaml || [ ! -s kubeconfig.yaml ]; then
+                            echo "Failed: kubeconfig.yaml file is empty or invalid."
+                            exit 1
+                        fi
+                    '''
+
+                    echo "kubeconfig.yaml has been successfully written to file."
+                }
+            }
+        }
+
+        stage('Socket Apply ENV Variable') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'DCR_AUTH', 
+                                                    usernameVariable: 'DOCKER_USERNAME', 
+                                                    passwordVariable: 'DOCKER_PASSWORD')]) {
+
+                        unstash name: 'socket.env'  
+                                                  
+                        sh """ 
+                        mv socket.env .env    
+                        export KUBECONFIG=kubeconfig.yaml
+                        # App secrets
+                        kubectl delete secret socket-app-secret --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER} --ignore-not-found
+                        kubectl create secret generic socket-app-secret --from-file=.env --namespace=\${BACKEND_DEPLOY_BRANCH_LOWER}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Socket Pull Chart') {
+            steps {
+                script {
+                    sh """
+                    aws ecr get-login-password --region ${ECR_DEFAULT_REGION} | helm registry login --username AWS --password-stdin ${HELM_REGISTRY}
+                    helm pull oci://${HELM_REGISTRY}/${CHART_NAME} --version ${CHART_VERSION}
+                    tar -xvf ${CHART_NAME}-${CHART_VERSION}.tgz
+                    """
+                }
+            }
+        }
+
+        stage('Socket Apply Deploy') {
+            steps {
+                script {
+                    sh """
+                    set -e
+                    export KUBECONFIG=kubeconfig.yaml
+
+                    # Helm upgrade/install command for apply action
+                    helm upgrade --install hive-release-socket-${BACKEND_DEPLOY_BRANCH_LOWER} ./${CHART_NAME} --create-namespace \\
+                        --namespace ${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set app.replicaCount=1 \\
+                        --set app.name=hive-socket \\
+                        --set app.image.repository=${IMAGE_REPOSITORY}/${PROJECT_NAME}/socket-${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set app.image.tag=${env.BUILD_ID} \\
+                        --set global.environment=hive-${BACKEND_DEPLOY_BRANCH_LOWER} \\
+                        --set ingress.enabled=true \\
+                        --set ingress.host=${SOCKET_DOMAIN} \\
+                        --set ingress.certificateArn=${env.SOCKETCERTIFICATEARN} \\
+                        --set ingress.environment=${ENVIRONMENT} \\
+                        --set filebeat.enabled=false \\
+                        --set app.volumes.googleSecret.enabled=false \\
+                        --set app.clusterIP.enabled=true \\
+                        --set app.resources.requests.cpu="150m" \\
+                        --set app.resources.requests.memory="150Mi" \\
+                        --set app.resources.limits.cpu="200m" \\
+                        --set app.resources.limits.memory="500Mi" \\
+                        --set ingress.group.enabled=true \\
+                        --set app.volumes.secrets.secretName=socket-app-secret
+                    """
+                }
+            }
+        }
+        stage('Socket Map Ingress Address to Cloudflare') {
+            steps {
+                script {
+                    echo 'Fetching ingress address...'
+                    
+                    def ingressAddress = ''
+                    def maxRetries = 10
+                    def retryInterval = 10 // seconds
+                    def attempt = 1
+
+                    while ((!ingressAddress || ingressAddress == '80' || ingressAddress == '443') && attempt <= maxRetries) {
+                        echo "Attempt ${attempt} to fetch ingress address..."
+                        ingressAddress = sh(
+                            script: """
+                            export KUBECONFIG=kubeconfig.yaml
+                            INGRESS_HOSTNAME=\$(kubectl get ingress -n ${BACKEND_DEPLOY_BRANCH_LOWER} -o jsonpath="{.items[?(@.spec.rules[0].host=='${SOCKET_DOMAIN}')].status.loadBalancer.ingress[0].hostname}")
+                            echo \$INGRESS_HOSTNAME
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                            echo "Invalid ingress address (${ingressAddress}), retrying in ${retryInterval} seconds..."
+                            sleep retryInterval
+                        }
+
+                        attempt++
+                    }
+
+                    if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                        error "Valid ingress address not found after ${maxRetries} attempts. Please verify the ingress configuration."
+                    }
+
+                    echo "Ingress Address: ${ingressAddress}"
+                    echo "Mapping CNAME in Cloudflare..."
+
+                    sh """
+                    curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                        -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        --data '{
+                            "type": "CNAME",
+                            "name": "${SOCKET_DOMAIN}",
+                            "content": "${ingressAddress}",
+                            "ttl": 60,
+                            "proxied": false
+                        }'
+                    """
+                }
+            }
+        }
+        stage('Frontend Request ACM Certificate') {
+            steps {
+                script {
+                    echo 'Requesting ACM certificate...'
+                    def certificateArn = sh(
+                        script: """
+                        aws acm request-certificate \
+                            --domain-name ${FRONT_END_DOMAIN} \
+                            --validation-method DNS \
+                            --subject-alternative-names www.${FRONT_END_DOMAIN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json | jq -r '.CertificateArn'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    env.FRONTENDCERTIFICATEARN = certificateArn
+                    echo "Certificate ARN: ${FRONTENDCERTIFICATEARN}"
+
+                    echo 'Fetching domain validation records...'
+                    def validationOutput = sh(
+                        script: """
+                        aws acm describe-certificate \
+                            --certificate-arn ${FRONTENDCERTIFICATEARN} \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --output json
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def validationData = readJSON text: validationOutput
+                    def domainValidationOptions = validationData.Certificate.DomainValidationOptions
+
+                    // Collect resource records for use in the next stage
+                    env.RESOURCE_RECORDS = domainValidationOptions.collect { domainValidation ->
+                        if (domainValidation.ValidationStatus == 'PENDING_VALIDATION' && domainValidation.containsKey('ResourceRecord') && domainValidation.ResourceRecord) {
+                            def resourceRecord = domainValidation.ResourceRecord
+                            echo "Validation for ${domainValidation.DomainName} requires DNS record:"
+                            echo "Name: ${resourceRecord.Name}"
+                            echo "Type: ${resourceRecord.Type}"
+                            echo "Value: ${resourceRecord.Value}"
+                            return "${resourceRecord.Name},${resourceRecord.Value}"
+                        } else if (domainValidation.ValidationStatus == 'SUCCESS') {
+                            echo "Validation for ${domainValidation.DomainName} is successful."
+                            return null  // No DNS record required for successful validation
+                        }
+                        return null
+                    }.findAll { it != null }.join('|')  // Use '|' as a delimiter
+
+                    // if (!env.RESOURCE_RECORDS) {
+                    //     error "No DNS validation records found. Please check previous stage for errors."
+                    // }
+                }
+            }
+        }
+
+        stage('Map Frontend CNAME in Cloudflare') {
+            steps {
+                script {
+                    if (!env.RESOURCE_RECORDS) {
+                        echo "Skipping CNAME mapping in Cloudflare as all validations are successful."
+                        return
+                    }
+                    echo 'Mapping CNAME in Cloudflare...'
+                    env.RESOURCE_RECORDS.split('\\|').each { record ->
+                        def (name, value) = record.split(',')
+                        sh """
+                        curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            --data '{
+                                "type": "CNAME",
+                                "name": "${name}",
+                                "content": "${value}",
+                                "ttl": 60,
+                                "proxied": false
+                            }'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Frontend Environment') {
+            steps {
+                sh """
+                # Install NVM
+                curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash
+                # Load NVM
+                ${NVM_SETUP}
+                nvm install ${NODE_VERSION}
+                ls -la
+                rm -rf ${WORKSPACE}/*
+                ls -la
+                rm -rf ${WORKSPACE}/.git
+                """
+            }
+        }
+
+     stage('Frontend Checkout Code') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: "*/${FRONTEND_DEPLOY_BRANCH}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${GIT_REPO_CREDENTIALS}", url: "${FRONTEND_GIT_REPO_URL}"]]]) 
+            }
+        }
+
+     stage('Get environment variables and Kubeconfig') {
+            steps {
+                script {
+                    unstash name: 'frontend.env' 
+
+                    def secrets = sh(script: """
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_FRONTEND_HELM_PATH} | jq -r '.data'
+                    """, returnStdout: true).trim()
+
+                    def FRONTEND_CHART_NAME = sh(script: "echo '${secrets}' | jq -r '.CHART_NAME'", returnStdout: true).trim()
+                    def FRONTEND_CHART_VERSION = sh(script: "echo '${secrets}' | jq -r '.CHART_VERSION'", returnStdout: true).trim()
+
+                    env.FRONTEND_CHART_NAME = FRONTEND_CHART_NAME
+                    env.FRONTEND_CHART_VERSION = FRONTEND_CHART_VERSION
+
+                    sh """
+                    mv frontend.env .env
+                    """
+
+                    sh """
+                    curl -k --silent --header "X-Vault-Token: ${VAULT_TOKEN}" \\
+                        --request GET "https://${VAULT_SERVER}/v1/${VAULT_FRONTEND_COMMON_PATH}" | jq -r '.data[".npmrc"]' > .npmrc
+                    if [ ! -s .npmrc ] || grep -q "null" .npmrc; then
+                        echo "Failed: .npmrc is empty or invalid"
+                        exit 1
+                    fi
+                    """
+
+                    sh """
+                    curl -k --silent --header "X-Vault-Token: ${VAULT_TOKEN}" \\
+                        --request GET "https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH}" | jq -r '.data["kubeconfig"]' > kubeconfig.yaml
+                    if [ ! -s kubeconfig.yaml ] || grep -q "null" kubeconfig.yaml; then
+                        echo "Failed: kubeconfig.yaml is empty or invalid"
+                        exit 1
+                    fi
+                    """
+                } 
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                sh """
+                # Load NVM
+                ${NVM_SETUP}
+                nvm use ${NODE_VERSION}
+                npm install -g yarn
+                yarn
+                yarn build
+                cp -r .next/static .next/standalone/.next/.
+                cp -r ./public .next/standalone/.
+                """
+            }
+        }       
+
+        stage('Build Frontend Docker image') {
+            steps {
+                script {
+                    frontendImage = docker.build("${IMAGE_REPOSITORY}/${PROJECT_NAME}/frontend-${BACKEND_DEPLOY_BRANCH_LOWER}:${env.BUILD_ID}")
+                }
+            }
+        }
+
+        stage('Frontend Push Docker image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${IMAGE_REPOSITORY}", "DCR_AUTH") {
+                        frontendImage.push("${env.BUILD_ID}")
+                    }
+                }
+            }
+        }
+
+        stage('Pull Frontend Chart') {
+            steps {
+                script {
+                    sh """
+                    aws ecr get-login-password --region ${ECR_DEFAULT_REGION} | helm registry login --username AWS --password-stdin ${HELM_REGISTRY}
+                    helm pull oci://${HELM_REGISTRY}/${FRONTEND_CHART_NAME} --version ${FRONTEND_CHART_VERSION}
+                    tar -xvf ${FRONTEND_CHART_NAME}-${FRONTEND_CHART_VERSION}.tgz
+                    """
+                }
+            }
+        }        
+
+        stage('Deploy Insert Env Vars to kubernetes') {
+            steps {
+                timeout(time: 15, unit: 'SECONDS') {
+                    script {
+                        sh """
+                        export KUBECONFIG=kubeconfig.yaml
+
+                        helm upgrade --install release-frontend-${BACKEND_DEPLOY_BRANCH_LOWER} ./${FRONTEND_CHART_NAME} --create-namespace --namespace ${BACKEND_DEPLOY_BRANCH_LOWER}\
+                            --set app.namespace=${BACKEND_DEPLOY_BRANCH_LOWER} \
+                            --set app.replicaCount=1 \
+                            --set app.name=frontend-${BACKEND_DEPLOY_BRANCH_LOWER} \
+                            --set app.image.repository=${IMAGE_REPOSITORY}/${PROJECT_NAME}/frontend-${BACKEND_DEPLOY_BRANCH_LOWER} \
+                            --set app.image.tag=${env.BUILD_ID} \
+                            --set environment=${BACKEND_DEPLOY_BRANCH_LOWER} \
+                            --set ingress.enabled=true \
+                            --set ingress.host=${FRONT_END_DOMAIN} \
+                            --set ingress.certificateArn=${FRONTENDCERTIFICATEARN} \
+                            --set ingress.group.enabled=true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Frontend Map Ingress Address to Cloudflare') {
+            steps {
+                script {
+                    echo 'Fetching ingress address...'
+                    
+                    def ingressAddress = ''
+                    def maxRetries = 10
+                    def retryInterval = 10
+                    def attempt = 1
+
+                    while ((!ingressAddress || ingressAddress == '80' || ingressAddress == '443') && attempt <= maxRetries) {
+                        echo "Attempt ${attempt} to fetch ingress address..."
+                        ingressAddress = sh(
+                            script: """
+                            export KUBECONFIG=kubeconfig.yaml
+                            INGRESS_HOSTNAME=\$(kubectl get ingress -n ${BACKEND_DEPLOY_BRANCH_LOWER} | grep ${FRONT_END_DOMAIN} | awk '{print \$4}')
+                            echo \$INGRESS_HOSTNAME
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                            echo "Invalid ingress address (${ingressAddress}), retrying in ${retryInterval} seconds..."
+                            sleep retryInterval
+                        }
+
+                        attempt++
+                    }
+
+                    if (!ingressAddress || ingressAddress == '80' || ingressAddress == '443') {
+                        error "Valid ingress address not found after ${maxRetries} attempts. Please verify the ingress configuration."
+                    }
+
+                    echo "Ingress Address: ${ingressAddress}"
+                    echo "Mapping CNAME in Cloudflare..."
+
+                    sh """
+                    curl -X POST https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records \
+                        -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        --data '{
+                            "type": "CNAME",
+                            "name": "${FRONT_END_DOMAIN}",
+                            "content": "${ingressAddress}",
+                            "ttl": 60,
+                            "proxied": false
+                        }'
+                    """
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            wrap([$class: 'BuildUser']) {
+                script {
+                    def triggeredBy = env.BUILD_USER ?: 'SCM Change'
+                    def slackMessage = """
+                    {
+                        "blocks": [
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": ":white_check_mark: *Deployment Success* :tada:"
+                                }
+                            },
+                            {
+                                "type": "section",
+                                "fields": [
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Environment:*\n${ENVIRONMENT}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Backend Branch:*\n${BACKEND_DEPLOY_BRANCH}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Backend URL:*\n${env.BACKEND_DOMAIN}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Frontend Branch:*\n${FRONTEND_DEPLOY_BRANCH}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Frontend URL:*\n${env.FRONT_END_DOMAIN}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Socket Branch:*\n${SOCKET_DEPLOY_BRANCH}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Socket URL:*\n${env.SOCKET_DOMAIN}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Database Branch:*\n${params.DATABASE_BRANCH}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Database URL:*\n${env.DNS_RECORD}"
+                                    },
+                                    {
+                                        "type": "mrkdwn",
+                                        "text": "*Triggered By:*\n${triggeredBy}"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                    """
+                    sh """
+                    curl --silent -X POST -H 'Content-type: application/json' \
+                    --data '${slackMessage}' \
+                    ${SLACK_WEBHOOK_URL}
+                    """
+                }
+            }
+        }
+
+        failure {
+            wrap([$class: 'BuildUser']) {
+                script {
+                    def triggeredBy = env.BUILD_USER ?: 'SCM Change'
+                    if (triggeredBy != 'SCM Change') {
+                        def slackMessage = """
+                        {
+                            "blocks": [
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": ":x: *Deployment Failed* :interrobang:"
+                                    }
+                                },
+                                {
+                                    "type": "section",
+                                    "fields": [
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*Environment:*\n${ENVIRONMENT}"
+                                        },
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*BACKEND Branch:*\n${BACKEND_DEPLOY_BRANCH}"
+                                        },
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*FRONTEND Branch:*\n${FRONTEND_DEPLOY_BRANCH}"
+                                        },
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*SOCKET Branch:*\n${SOCKET_DEPLOY_BRANCH}"
+                                        },
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*DATABASE Branch:*\n${params.DATABASE_BRANCH}"
+                                        },
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": "*Triggered By:*\n${triggeredBy}"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                        """
+                        sh """
+                        curl --silent -X POST -H 'Content-type: application/json' \
+                        --data '${slackMessage}' \
+                        ${SLACK_WEBHOOK_URL}
+                        """
+                    } else {
+                        echo "Check Console for more details."
+                    }
+                }
+            }
+        }
+
+        always {
+            cleanWs()
+            echo "Pipeline Completed."
+        }
+    }
+}

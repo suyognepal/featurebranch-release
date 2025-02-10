@@ -1,0 +1,220 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BACKEND_DEPLOY_BRANCH', defaultValue: 'DIAL-6745', description: 'Feature Branch to delete')
+    }
+
+    environment {
+        ANSIBLE_HOST_KEY_CHECKING = "False"
+        HELM_REGISTRY = credentials('helm-registry')
+        AWS_DEFAULT_REGION = 'us-east-1'
+        VAULT_FRONTEND_HELM_PATH = "appsecrets/secret/path/helm-release"
+        VAULT_CICD_PATH = "infra/release-ansible"
+        VAULT_TOKEN = credentials('VAULT_TOKEN')
+        VAULT_SERVER = "vault.example.com"
+        VAULT_HELM_PATH = "appsecrets/secret/path/helm-release"
+        VAULT_SECRET_PATH = "appsecrets/secret/path/release"
+    }
+
+    stages {
+        stage('Fetch Secrets and Prepare Variables') {
+            steps {
+                script {
+                    def vaultResponse = sh(
+                        script: """
+                        curl -sk -H "X-Vault-Token: ${VAULT_TOKEN}" -X GET https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH}
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def secretsData = readJSON text: vaultResponse
+                    def secrets = readYaml text: secretsData.data["vars.yaml"]
+
+                    def sshKey = secretsData.data["id_rsa.pem"]
+                    writeFile file: 'id_rsa.pem', text: sshKey
+                    sh "chmod 600 id_rsa.pem"
+                    env.BACKEND_DEPLOY_BRANCH_LOWER = "${params.BACKEND_DEPLOY_BRANCH}".toLowerCase()
+                    env.DB_INSTANCE = params.BACKEND_DEPLOY_BRANCH
+                    env.DB_URL = "${BACKEND_DEPLOY_BRANCH_LOWER}-db.example.com"
+                    env.CLOUDFLARE_TOKEN = secrets.cloudfare_token
+                    env.DNS_ZONE = secrets.dns_zone
+                    env.FRONT_END_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}.example.com"
+                    env.BACKEND_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}-api.example.com"
+                    env.SOCKET_DOMAIN = "${BACKEND_DEPLOY_BRANCH_LOWER}-socket.example.com"
+                }
+            }
+        }
+
+        stage('Delete Edgedb Database Instance') {
+            steps {
+                sh '''
+                ansible-playbook -i ansible/inventory/edgedb.ini ansible/roles/edgedb/tasks/delete.yaml \
+                --private-key=id_rsa.pem \
+                --extra-vars "db_instance=${DB_INSTANCE} \
+                    dns_record=${DB_URL} \
+                    dns_zone=${DNS_ZONE} \
+                    cloudfare_token=${CLOUDFLARE_TOKEN} \
+                    backend_deploy_branch=${BACKEND_DEPLOY_BRANCH}"
+                '''
+            }
+        }
+        
+        stage('Delete Cloudflare DNS Records') {
+            steps {
+                script {
+                    def domains = ["${FRONT_END_DOMAIN}", "${BACKEND_DOMAIN}", "${SOCKET_DOMAIN}"]
+
+                    for (domain in domains) {
+                        def recordId = sh(
+                            script: """
+                            curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records?name=${domain}" \
+                            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id'
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (recordId && recordId != "null") {
+                            sh """
+                            curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${DNS_ZONE}/dns_records/${recordId}" \
+                            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" -H "Content-Type: application/json"
+                            """
+                            echo "Deleted Cloudflare record: ${domain}"
+                        } else {
+                            echo "No DNS record found for ${domain}"
+                        }
+                    }
+                }
+            }
+        }
+
+        
+        stage('Configure AWS Credentials') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'aws-credentials', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh """
+                    aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                    aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                    aws configure set region $AWS_DEFAULT_REGION
+                    """
+                }
+            }
+        }
+
+        stage('Backend Retrieve Environment Variables') {
+            steps {
+                script {
+                    sh '''
+                        curl -k --header "X-Vault-Token: ${VAULT_TOKEN}" \
+                        --request GET https://${VAULT_SERVER}/v1/${VAULT_CICD_PATH} | jq -r '.data["kubeconfig"]' > kubeconfig.yaml
+                        if [ $? -ne 0 ] || grep -q "null" kubeconfig.yaml || [ ! -s kubeconfig.yaml ]; then
+                            echo "Failed: kubeconfig.yaml file is empty or invalid."
+                            exit 1
+                        fi
+                    '''
+                    echo "kubeconfig.yaml has been successfully written to file."
+                }
+            }
+        }
+
+        stage('Delete Chart Release') {
+            steps {
+                script {
+                    withEnv(["KUBECONFIG=kubeconfig.yaml"]) {
+                        // Verify the kubeconfig is valid
+                        sh "kubectl get pods"
+
+                        def releases = sh(
+                            script: "helm list -n ${BACKEND_DEPLOY_BRANCH_LOWER} | awk 'NR>1 {print \$1}'",
+                            returnStdout: true
+                        ).trim()
+
+                        if (releases) {
+                            sh """
+                            echo "Deleting Helm releases: ${releases}"
+                            echo "${releases}" | xargs -r helm delete -n ${BACKEND_DEPLOY_BRANCH_LOWER}
+                            """
+                        } else {
+                            echo "No Helm releases found in namespace ${BACKEND_DEPLOY_BRANCH_LOWER}. Skipping deletion."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Delete Namespace') {
+            steps {
+                script {
+                    withEnv(["KUBECONFIG=kubeconfig.yaml"]) {
+                        def namespaceExists = sh(
+                            script: "kubectl get ns ${BACKEND_DEPLOY_BRANCH_LOWER} --ignore-not-found --no-headers",
+                            returnStdout: true
+                        ).trim()
+
+                        if (namespaceExists) {
+                            sh """
+                            echo "Deleting namespace: ${BACKEND_DEPLOY_BRANCH_LOWER}"
+                            kubectl delete ns ${BACKEND_DEPLOY_BRANCH_LOWER}
+                            """
+                        } else {
+                            echo "Namespace ${BACKEND_DEPLOY_BRANCH_LOWER} not found. Skipping deletion."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Delete ACM Certificates') {
+            steps {
+                script {
+                    echo 'Deleting ACM certificates...'
+
+                    def domains = [
+                        "${FRONT_END_DOMAIN}",
+                        "${BACKEND_DOMAIN}",
+                        "${SOCKET_DOMAIN}"
+                    ]
+
+                    domains.each { domain ->
+                        echo "Processing domain: ${domain}"
+
+                        def certificates = sh(
+                            script: """
+                            aws acm list-certificates \
+                                --region ${AWS_DEFAULT_REGION} \
+                                --query "CertificateSummaryList[?DomainName=='${domain}'].CertificateArn" \
+                                --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (certificates) {
+                            def certificateArns = certificates.split()
+
+                            certificateArns.each { arn ->
+                                echo "Deleting certificate ARN: ${arn}"
+                                sh """
+                                aws acm delete-certificate \
+                                    --certificate-arn ${arn} \
+                                    --region ${AWS_DEFAULT_REGION}
+                                """
+                                echo "Deleted certificate ARN: ${arn}"
+                            }
+                        } else {
+                            echo "No certificates found for domain: ${domain}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "Deletion completed successfully."
+        }
+        failure {
+            echo "Deletion failed. Check the logs for errors."
+        }
+    }
+}

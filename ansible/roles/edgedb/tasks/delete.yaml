@@ -1,0 +1,94 @@
+---
+- name: Delete EdgeDB Resources
+  hosts: all
+
+  tasks:
+    - name: Stop and Destroy EdgeDB Instance
+      ansible.builtin.shell: |
+        edgedb instance stop -I {{ db_instance }}
+        edgedb instance destroy -I {{ db_instance }} --non-interactive
+      ignore_errors: yes
+
+    # - name: Uninstall EdgeDB
+    #   ansible.builtin.apt:
+    #     name: edgedb-5
+    #     state: absent
+
+    # - name: Remove EdgeDB Repository and GPG Key
+    #   ansible.builtin.file:
+    #     path: "{{ item }}"
+    #     state: absent
+    #   loop:
+    #     - /etc/apt/sources.list.d/edgedb.list
+    #     - /usr/local/share/keyrings/edgedb-keyring.gpg
+
+    - name: Remove Git repository
+      ansible.builtin.file:
+        path: "{{ db_instance }}"
+        state: absent
+      become: yes
+
+    - name: Remove Nginx Configurations
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-available/{{ backend_deploy_branch }}"
+        state: absent
+      become: yes
+    
+
+    - name: Remove Nginx Enabled Site
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/{{ backend_deploy_branch }}"
+        state: absent
+      become: yes
+
+
+    - name: Restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      become: yes
+
+    - name: Get Cloudflare DNS Records
+      uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ dns_zone }}/dns_records"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cloudfare_token }}"
+          Content-Type: "application/json"
+      register: cloudflare_dns_records
+
+    - name: Remove Cloudflare DNS Record if Exists
+      uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ dns_zone }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cloudfare_token }}"
+          Content-Type: "application/json"
+      with_items: "{{ cloudflare_dns_records.json.result }}"
+      when: item.name == dns_record
+      ignore_errors: yes
+
+    - name: Revoke and Delete SSL Certificate
+      shell: certbot delete --cert-name "{{ dns_record }}"
+      ignore_errors: yes
+      become: yes
+
+    # - name: Remove Certbot and Nginx
+    #   ansible.builtin.apt:
+    #     name:
+    #       - nginx
+    #       - certbot
+    #       - python3-certbot-nginx
+    #     state: absent
+
+    - name: Remove Environment and Python Config Files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/home/ubuntu/{{ backend_deploy_branch }}.py"
+
+    # - name: Uninstall Python Packages
+    #   ansible.builtin.pip:
+    #     name: edgedb
+    #     state: absent

@@ -1,0 +1,13 @@
+db_instance: db2
+db_port: 10702
+db_branch_instance: branch1
+gituser: xxxxxxxxxxx
+gitpassword: xxxxxxxxxxxxxxx
+gitbranch: main
+dns_record: db2.example.com
+cloudfare_token: xxxxxxxxxxxxxxxxxxxxxxxxxx
+dns_zone: xxxxxxxxxxxxxxxxxxxxxxxxx
+publicip: xxx.xx.xx.xx
+backend_deploy_branch: main
+admin_email: system@example.com
+frontend_url: https://example.com:3000
